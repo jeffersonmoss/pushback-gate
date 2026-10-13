@@ -61,7 +61,10 @@ dependencies.
    edits are held until the verdict, capped at 4 minutes. "Just do it": no consult.
 6. **Checkpoint.** Before a consult, the working tree is snapshotted as a commit on
    `refs/pushback-gate/consult-N` through a temporary index, so your branch, your staging area and your
-   `git log` are untouched. Restore after a STOP with `git checkout <sha> -- .`. A folder without git gets
+   `git log` are untouched. Restore after a STOP with the command the verdict prints,
+   `python3 gate.py restore refs/pushback-gate/consult-N <repo>`: every snapshotted file goes back without touching
+   your index or branch, and files created since the snapshot are moved aside into the gate's state folder, not
+   deleted. The restore is covered by a test. A folder without git gets
    `git init` and an ignore file for secret and generated files. Cloud-synced folders (Google Drive,
    iCloud, Dropbox, OneDrive) get no repository and no checkpoint, because a `.git` folder inside a
    sync client is a bad time.
@@ -70,7 +73,11 @@ dependencies.
    Nothing ever hangs: any hook error, worker crash or timeout releases the gate and says so.
 8. **Steering.** Any genuine new prompt from you supersedes a pending consult. Machine prompts (task
    notifications, app-generated suggestions, the gate's own briefs) are ignored entirely.
-9. **Recursion guard.** The reviewer runs with `PUSHBACK_GATE_INTERNAL=1` and every prompt the gate sends
+9. **Agree what success means.** The gate asks the builder to state in one line what success means before
+   starting, and the verdict asks whether the reviewer's restated GOAL matches it. A mismatch goes to you before
+   any notes do, because notes aimed at the wrong goal are worthless, and a proof can establish the wrong
+   requirement.
+10. **Recursion guard.** The reviewer runs with `PUSHBACK_GATE_INTERNAL=1` and every prompt the gate sends
    starts with a sentinel line, so the reviewer's own session does not get gated and start another
    reviewer.
 
@@ -100,6 +107,7 @@ The full brief is in `reviewer-brief.md`. The parts that matter:
 | A command already running when the verdict lands | cannot be retracted | cannot be retracted |
 | Input typed into an existing shell (`write_stdin`) | n/a | not re-checked by hooks |
 | Worker killed with SIGKILL mid-consult | consult looks alive until the deadline | same |
+| Reviewer quietly becomes a rubber stamp | not detected automatically; run `tests/canary.py` | same |
 
 It also costs something: every consult is a model call with the repository context, roughly 20 to 40
 seconds and a few thousand tokens on the reviewing vendor's subscription. The classifier call for
@@ -137,8 +145,14 @@ ambiguous prompts is another small one. If you are on a small plan, set `effort`
    side. `trash_tool` and `reversible_delete_tools` are optional and refer to a trash-style delete
    command if you use one; delete those keys if you do not.
 5. Run the tests: `python3 ~/.claude/scripts/pushback_gate/tests/test_gate.py`. They use canned verdicts
-   and make no model calls. 28 tests, about a minute.
-6. Open a new session in a code folder and type something like "rewrite the config loader as a plugin
+   and make no model calls. 30 tests, about a minute and a half.
+6. Run the canary: `python3 ~/.claude/scripts/pushback_gate/tests/canary.py` (add `--client codex` to test
+   the other direction). It builds a tiny fixture repository, sends the real reviewer one request it must
+   STOP (a second database bolted on as a cache) and one it must let through (input validation using an
+   existing helper), and fails if either verdict is wrong. Two live model calls, about a minute. This is
+   how you find out that the checker has quietly become a rubber stamp. Run it after installing and
+   whenever the reviewer model or a CLI version changes.
+7. Open a new session in a code folder and type something like "rewrite the config loader as a plugin
    system". You should see the gate's note under your prompt, and within about 30 seconds a verdict on
    your next tool call. The log is `~/.local/state/pushback_gate/gate.log`.
 
@@ -211,7 +225,8 @@ gate/
   review_worker.py     detached worker: classification, brief, reviewer call, publish
   policy.json          every rule, pattern and threshold
   reviewer-brief.md    the reviewer's instructions and output format
-  tests/test_gate.py   28 tests with canned verdicts, no model calls
+  tests/test_gate.py   30 tests with canned verdicts, no model calls
+  tests/canary.py      live check: the reviewer must STOP a known-bad request and pass a known-good one
 install/
   claude-settings-hooks.json   hook entries for ~/.claude/settings.json
   codex-hooks.json             hook entries for ~/.codex/hooks.json

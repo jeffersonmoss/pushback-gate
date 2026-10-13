@@ -411,6 +411,39 @@ class TestGate(unittest.TestCase):
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertEqual(self.h.last_rc, 0)
 
+    def test_restore_returns_tree_to_snapshot_without_touching_index(self):
+        p = G.load_policy()
+        sha, ref, note = G.checkpoint(self.h.repo, "consult-9", p)
+        self.assertTrue(sha, note)
+        app = os.path.join(self.h.repo, "app.py")
+        with open(app, "w") as f:
+            f.write("def main():\n    return 2  # changed after the snapshot\n")
+        with open(os.path.join(self.h.repo, "new_module.py"), "w") as f:
+            f.write("x = 1\n")
+        # the owner's index must stay as it was (nothing staged) through checkpoint and restore
+        ok, rnote = G.restore(self.h.repo, ref)
+        self.assertTrue(ok, rnote)
+        self.assertEqual(open(app).read(), "def main():\n    return 1\n")
+        self.assertFalse(os.path.exists(os.path.join(self.h.repo, "new_module.py")))
+        self.assertIn("moved to", rnote)
+        staged = subprocess.run(["git", "diff", "--cached", "--name-only"], cwd=self.h.repo, capture_output=True, text=True).stdout
+        self.assertEqual(staged.strip(), "")
+        branch = subprocess.run(["git", "log", "--oneline"], cwd=self.h.repo, capture_output=True, text=True).stdout
+        self.assertEqual(len(branch.strip().splitlines()), 1)  # no visible commits
+        # the restore command line the STOP verdict prints must work too
+        r = subprocess.run([sys.executable, GATE, "restore", "nonexistent-ref", self.h.repo], capture_output=True, text=True, env=self.h.env())
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("no such checkpoint", r.stdout)
+
+    def test_stop_verdict_carries_restore_command_and_goal_question(self):
+        fake = self.h.fake("stop.txt", "VERDICT: STOP\nREASON: no.\nGOAL: keep the app returning one.\nNOTES:\n- 1. app.py: x\nSHAPE:\n- files: app.py\n- expected size: small\n")
+        self.h.hook("UserPromptSubmit", {"prompt": "rewrite the config loader as a plugin system"}, PUSHBACK_GATE_FAKE_VERDICT=fake)
+        self.h.join_workers()
+        out = self.h.hook("PreToolUse", {"tool_name": "Edit", "tool_input": {"file_path": os.path.join(self.h.repo, "app.py")}})
+        reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("restore refs/pushback-gate/consult-1", reason)
+        self.assertIn("Does this match what you understand success to mean", reason)
+
     def test_disabled_policy_is_silent(self):
         pol = os.path.join(ROOT, "policy.json")
         orig = open(pol).read()

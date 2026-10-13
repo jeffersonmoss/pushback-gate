@@ -32,6 +32,11 @@ def main():
     global CLIENT, EVENT
     if len(sys.argv) < 3:
         return
+    if sys.argv[1] == "restore":
+        # gate.py restore <sha-or-ref> [folder]   (run by a person or the builder after a STOP)
+        ok, note = G.restore(sys.argv[3] if len(sys.argv) > 3 else os.getcwd(), sys.argv[2])
+        print(("restored: " if ok else "restore failed: ") + note)
+        sys.exit(0 if ok else 1)
     CLIENT, EVENT = sys.argv[1], sys.argv[2]
     if G.is_internal():
         return
@@ -128,6 +133,9 @@ def on_prompt(data, policy):
         "the owner both sides in a few lines (the request, the reviewer's objection and alternative, your own view) and end with "
         "STATUS: needs-you; reads and questions stay allowed. The reviewer saw the request plus read-only repository access: weigh "
         "its view, do not defer to it. The owner's explicit choice outranks the reviewer." % policy["verdict_gate_seconds"],
+        "Before you start, state in one line what success means for this request (the outcome, not the means). When the verdict "
+        "arrives, say whether the reviewer's GOAL matches that line; if it does not, tell the owner first, because notes aimed at "
+        "the wrong goal are worthless.",
     ]
     emit_prompt_context("\n".join(extra + rules))
 
@@ -263,13 +271,18 @@ def render_verdict(g, late=False):
     if g.get("reason"):
         parts.append("Reason: " + g["reason"])
     if g.get("goal"):
-        parts.append("Goal as the reviewer read it: " + g["goal"])
+        parts.append("Goal as the reviewer read it: " + g["goal"] +
+                     "\nDoes this match what you understand success to mean? Say so in one line; a mismatch goes to the owner "
+                     "before the notes do.")
     if g.get("notes"):
         parts.append("Notes:\n" + g["notes"])
     if g.get("shape"):
         parts.append("Proposed shape:\n" + g["shape"])
     if v == "UNPARSED" and g.get("raw"):
         parts.append("Raw reviewer text:\n" + g["raw"][:4000])
+    if v == "STOP" and g.get("checkpoint") and g.get("root"):
+        parts.append("Pre-build snapshot: %s. To undo everything since: python3 %s restore %s \"%s\" (new files are moved aside, not "
+                     "deleted)." % (g["checkpoint"][:10], os.path.abspath(__file__), g.get("checkpoint_ref") or g["checkpoint"], g["root"]))
     return "\n".join(parts)
 
 

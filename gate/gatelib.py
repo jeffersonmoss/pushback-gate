@@ -287,6 +287,51 @@ def _checkpoint_locked(root, label, note, budget):
             pass
 
 
+def restore(cwd, target):
+    """Return the working tree to a checkpoint (a sha or a refs/pushback-gate/... ref) without touching the
+    owner's index or branch. Files present now that the snapshot does not contain are moved, not deleted, to
+    STATE_ROOT/restore-leftovers/<timestamp>/ so the restore itself is reversible. Returns (ok, note)."""
+    root = git_root(cwd)
+    if not root:
+        return False, "not a git repository: %s" % cwd
+    rc, sha, err = git(["rev-parse", "--verify", "-q", target + "^{commit}"], root)
+    if rc != 0 or not sha:
+        return False, "no such checkpoint: %s" % target
+    env = dict(os.environ)
+    tmp_index = os.path.join(root, ".git", "pushback-gate-restore-index-%d" % os.getpid())
+    env["GIT_INDEX_FILE"] = tmp_index
+    try:
+        rc, _, err = git(["read-tree", sha], root, timeout=30, env=env)
+        if rc != 0:
+            return False, "read-tree failed: %s" % err[:160]
+        rc, _, err = git(["checkout-index", "-a", "-f"], root, timeout=120, env=env)
+        if rc != 0:
+            return False, "checkout-index failed: %s" % err[:160]
+        rc, snap, _ = git(["ls-tree", "-r", "--name-only", sha], root, timeout=30)
+        rc2, now, _ = git(["ls-files", "--cached", "--others", "--exclude-standard"], root, timeout=30)
+        extra = sorted(set(now.splitlines()) - set(snap.splitlines()))
+        moved = []
+        if extra:
+            dest = os.path.join(STATE_ROOT, "restore-leftovers", time.strftime("%Y-%m-%d-%H%M%S") + "-" + sha[:8])
+            for rel in extra:
+                src = os.path.join(root, rel)
+                if not os.path.isfile(src):
+                    continue
+                dst = os.path.join(dest, rel)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                os.replace(src, dst)
+                moved.append(rel)
+        note = "restored %d files from %s" % (len(snap.splitlines()), sha[:10])
+        if moved:
+            note += "; %d files that the snapshot did not contain were moved to %s" % (len(moved), dest)
+        return True, note
+    finally:
+        try:
+            os.unlink(tmp_index)
+        except OSError:
+            pass
+
+
 # ---------------------------------------------------------------- prompt rules
 
 def _any(patterns, text):
