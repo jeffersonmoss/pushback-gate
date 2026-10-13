@@ -1,0 +1,410 @@
+{
+  "schema": 2,
+  "enabled": true,
+  "_about": "Pushback Gate policy. Edit by hand. Patterns are Python regexes matched case-insensitively. reviewer_by_client: for each building client, which CLI reviews (route codex|claude), the model ids to try in order, and a label. trash_tool: optional argv prefix of a trash-style delete tool used to prune old session state; reversible_delete_tools: executables treated as reversible deletes (never denied while a consult is pending).",
+  "reviewer_by_client": {
+    "claude": {
+      "route": "codex",
+      "alias": "sol",
+      "label": "Sol (Codex)",
+      "models": [
+        "gpt-6.1-sol",
+        "gpt-6-sol"
+      ]
+    },
+    "codex": {
+      "route": "claude",
+      "alias": "opus",
+      "label": "Opus (Claude Code)",
+      "models": [
+        "opus"
+      ]
+    }
+  },
+  "classifier_model": "haiku",
+  "effort": "medium",
+  "effort_low_when_seven_day_percent_at_least": 90,
+  "verdict_gate_seconds": 180,
+  "wait_mode_seconds": 240,
+  "stop_grace_seconds": 8,
+  "stop_blocks_max_per_generation": 2,
+  "checkpoint_seconds": 20,
+  "session_state_days": 14,
+  "brief_max_chars": 60000,
+  "named_file_max_chars": 12000,
+  "tree_max_entries": 300,
+  "tree_max_depth": 3,
+  "git_log_entries": 20,
+  "size_bands_lines": {
+    "small": 80,
+    "medium": 400
+  },
+  "cloud_sync_markers": [
+    "/GoogleDrive/",
+    "/Google Drive",
+    "/Library/CloudStorage/",
+    "/Dropbox/",
+    "/Library/Mobile Documents/",
+    "/OneDrive"
+  ],
+  "code_extensions": [
+    ".py",
+    ".js",
+    ".ts",
+    ".tsx",
+    ".jsx",
+    ".swift",
+    ".go",
+    ".rs",
+    ".rb",
+    ".java",
+    ".kt",
+    ".c",
+    ".cc",
+    ".cpp",
+    ".h",
+    ".m",
+    ".mm",
+    ".cs",
+    ".php",
+    ".sh",
+    ".zsh",
+    ".sql",
+    ".html",
+    ".css",
+    ".scss",
+    ".vue",
+    ".svelte",
+    ".lua",
+    ".dart",
+    ".ex",
+    ".exs",
+    ".scala"
+  ],
+  "manifest_files": [
+    "package.json",
+    "pyproject.toml",
+    "requirements.txt",
+    "Cargo.toml",
+    "go.mod",
+    "Gemfile",
+    "Package.swift",
+    "Podfile",
+    "build.gradle",
+    "pom.xml",
+    "composer.json"
+  ],
+  "machine_prompt_patterns": [
+    "^\\s*<system-reminder>",
+    "^\\s*<task-notification>",
+    "\\[SYSTEM NOTIFICATION",
+    "^\\s*This is an app-generated request",
+    "^\\s*Review brief follows",
+    "^\\s*<ci-monitor-event>",
+    "^\\s*\\[Artifact comment sent to Claude\\]",
+    "<command-name>"
+  ],
+  "mode_skip_patterns": [
+    "\\bjust do it\\b",
+    "\\bno review\\b",
+    "\\bskip (the )?review\\b",
+    "\\bwithout (a )?review\\b"
+  ],
+  "mode_wait_patterns": [
+    "\\bwait for (the |a )?review\\b",
+    "\\breview (it |this )?first\\b",
+    "\\bsecond opinion first\\b",
+    "\\bget (a )?(review|consult|second opinion) before\\b",
+    "\\bconsult first\\b",
+    "\\bbefore (you )?(start|begin|build|implement)\\b.{0,60}\\b(review|consult|second opinion)\\b"
+  ],
+  "imperative_patterns": [
+    "^\\s*(please\\s+)?(add|refactor|rewrite|migrate|replace|switch|introduce|build|implement|install|create|set up|restructure|redesign|split|merge|extract)\\b"
+  ],
+  "skip_patterns": [
+    "^\\s*(explain|describe|summari[sz]e|show me|list|tell me|walk me through|what does|remind me)\\b",
+    "^\\s*(read|look at|check|inspect|investigate|debug|diagnose|find|search|grep|trace|look into|review|audit|compare|evaluate|assess)\\b",
+    "^\\s*(fix|correct) (the |a )?(typo|spelling|wording|comment|docstring|formatting|indentation|lint)",
+    "^\\s*(rename|retitle)\\b",
+    "^\\s*(commit|push|stage|git (commit|push|status|log|diff))\\b",
+    "^\\s*(run|execute|rerun|re-run) (the )?(tests?|build|linter|script|command|suite)\\b",
+    "^\\s*(yes|yeah|ok|okay|sure|go ahead|continue|carry on|proceed|do it|thanks|thank you|a\\d+|no|nope)\\b[^\\n]{0,60}$",
+    "^\\s*(update|bump) (the )?(version|changelog|readme|docs?|documentation)\\b"
+  ],
+  "consult_patterns": [
+    "\\b(refactor|rewrite|restructure|redesign|re-architect|rearchitect|reorganize|migrate|port)\\b",
+    "\\b(add|introduce|create|build|set up|setup|implement|wire up|integrate)\\b.{0,40}\\b(dependency|dependencies|library|package|framework|table|column|schema|model|service|layer|module|abstraction|cache|caching|queue|worker|daemon|microservice|endpoint|api|interface|protocol|plugin|middleware|orm|database|db|index|pipeline|event bus|state machine)\\b",
+    "\\b(use|switch to|move to|adopt|replace .{1,40} with)\\b.{0,40}\\b(library|package|framework|redis|postgres|sqlite|mongo|graphql|rest|grpc|websocket|react|vue|svelte|django|flask|fastapi|express|next\\.?js|tailwind|typescript)\\b",
+    "\\b(install|npm i|npm install|pip install|brew install|cargo add|yarn add|pnpm add)\\b",
+    "\\b(schema|migration|data model|database design|architecture|architectural|global state|singleton|new abstraction|inheritance hierarchy|second (database|cache|copy))\\b",
+    "\\b(make it|make this) (generic|configurable|pluggable|extensible|reusable|async|multi-?threaded|distributed)\\b",
+    "\\b(split|merge|extract|consolidate) .{0,40}\\b(module|modules|file|files|class|classes|service|services|package|packages)\\b"
+  ],
+  "irreversible_commands": {
+    "always": [
+      "rm",
+      "rmdir",
+      "unlink",
+      "shred",
+      "srm",
+      "mail",
+      "sendmail",
+      "mutt",
+      "signal-cli",
+      "twilio",
+      "dropdb"
+    ],
+    "subcommands": {
+      "npm": [
+        "i",
+        "install",
+        "add",
+        "uninstall",
+        "remove",
+        "rm",
+        "publish"
+      ],
+      "pnpm": [
+        "i",
+        "install",
+        "add",
+        "remove",
+        "rm",
+        "publish"
+      ],
+      "yarn": [
+        "add",
+        "remove",
+        "install",
+        "publish"
+      ],
+      "pip": [
+        "install",
+        "uninstall"
+      ],
+      "pip3": [
+        "install",
+        "uninstall"
+      ],
+      "brew": [
+        "install",
+        "uninstall",
+        "remove",
+        "upgrade"
+      ],
+      "cargo": [
+        "add",
+        "remove",
+        "install",
+        "publish"
+      ],
+      "gem": [
+        "install",
+        "uninstall"
+      ],
+      "go": [
+        "install",
+        "get"
+      ],
+      "gh": [
+        "pr create",
+        "pr merge",
+        "pr close",
+        "release create",
+        "repo delete",
+        "issue close"
+      ],
+      "vercel": [
+        "deploy",
+        "--prod",
+        "rm",
+        "remove"
+      ],
+      "netlify": [
+        "deploy"
+      ],
+      "fly": [
+        "deploy",
+        "destroy"
+      ],
+      "heroku": [
+        "run",
+        "config:set",
+        "config:unset",
+        "pg:reset",
+        "releases:rollback",
+        "apps:destroy"
+      ],
+      "kubectl": [
+        "apply",
+        "delete",
+        "rollout"
+      ],
+      "terraform": [
+        "apply",
+        "destroy"
+      ],
+      "docker": [
+        "push",
+        "rm",
+        "rmi",
+        "system prune"
+      ],
+      "alembic": [
+        "upgrade",
+        "downgrade",
+        "stamp"
+      ],
+      "prisma": [
+        "migrate dev",
+        "migrate deploy",
+        "migrate reset",
+        "db push"
+      ],
+      "rails": [
+        "db:migrate",
+        "db:reset",
+        "db:drop"
+      ],
+      "flask": [
+        "db upgrade",
+        "db downgrade"
+      ],
+      "django-admin": [
+        "migrate",
+        "flush"
+      ],
+      "manage.py": [
+        "migrate",
+        "flush"
+      ],
+      "knex": [
+        "migrate:latest",
+        "migrate:rollback"
+      ],
+      "sequelize": [
+        "db:migrate",
+        "db:migrate:undo"
+      ],
+      "typeorm": [
+        "migration:run",
+        "migration:revert"
+      ],
+      "dbmate": [
+        "up",
+        "down",
+        "drop"
+      ],
+      "goose": [
+        "up",
+        "down",
+        "reset"
+      ],
+      "diesel": [
+        "migration run",
+        "migration revert",
+        "database reset"
+      ],
+      "osascript": [
+        "-e"
+      ]
+    },
+    "git_subcommands": [
+      "push",
+      "clean",
+      "branch -D",
+      "reflog expire",
+      "gc"
+    ],
+    "sql_clients": [
+      "psql",
+      "mysql",
+      "sqlite3",
+      "mongo",
+      "mongosh"
+    ]
+  },
+  "edit_tools": [
+    "Edit",
+    "Write",
+    "MultiEdit",
+    "NotebookEdit",
+    "apply_patch"
+  ],
+  "read_tools": [
+    "Read",
+    "Grep",
+    "Glob",
+    "LS",
+    "WebFetch",
+    "WebSearch",
+    "TodoRead",
+    "ToolSearch",
+    "AskUserQuestion",
+    "ListAgents",
+    "ReadNotifications",
+    "view_image",
+    "read_file"
+  ],
+  "shell_tools": [
+    "Bash",
+    "shell",
+    "local_shell",
+    "exec_command",
+    "container.exec",
+    "shell_command"
+  ],
+  "readonly_executables": [
+    "cat",
+    "ls",
+    "head",
+    "tail",
+    "grep",
+    "rg",
+    "find",
+    "wc",
+    "stat",
+    "file",
+    "which",
+    "echo",
+    "pwd",
+    "sed",
+    "awk",
+    "sort",
+    "uniq",
+    "tree",
+    "du",
+    "df",
+    "ps",
+    "env",
+    "printenv",
+    "type",
+    "jq",
+    "diff",
+    "cd",
+    "less",
+    "more",
+    "basename",
+    "dirname",
+    "realpath",
+    "date",
+    "whoami",
+    "hostname",
+    "uname",
+    "true",
+    "false",
+    "test",
+    "[",
+    "printf",
+    "md5",
+    "shasum",
+    "open"
+  ],
+  "trash_tool": [
+    "python3",
+    "~/.claude/scripts/safe_rm.py"
+  ],
+  "reversible_delete_tools": [
+    "safe_rm.py"
+  ]
+}

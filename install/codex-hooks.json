@@ -1,0 +1,13 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "python3 ~/.claude/scripts/pushback_gate/gate.py codex UserPromptSubmit", "timeout": 30 } ] }
+    ],
+    "PreToolUse": [
+      { "hooks": [ { "type": "command", "command": "python3 ~/.claude/scripts/pushback_gate/gate.py codex PreToolUse", "timeout": 15 } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "python3 ~/.claude/scripts/pushback_gate/gate.py codex Stop", "timeout": 60 } ] }
+    ]
+  }
+}

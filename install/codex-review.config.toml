@@ -1,0 +1,7 @@
+# Codex CLI profile "review". Save as ~/.codex/review.config.toml.
+# Codex layers $CODEX_HOME/<name>.config.toml on top of your base config when you pass -p <name>.
+# Read-only: the reviewer can read the repository but cannot write files or reach the network from the shell.
+# approval_policy = "never" is what lets a headless call finish without a human clicking anything.
+sandbox_mode = "read-only"
+approval_policy = "never"
+model_reasoning_effort = "medium"
