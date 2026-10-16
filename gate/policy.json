@@ -1,7 +1,7 @@
 {
   "schema": 2,
   "enabled": true,
-  "_about": "Pushback Gate policy. Edit by hand. Patterns are Python regexes matched case-insensitively. reviewer_by_client: for each building client, which CLI reviews (route codex|claude), the model ids to try in order, and a label. trash_tool: optional argv prefix of a trash-style delete tool used to prune old session state; reversible_delete_tools: executables treated as reversible deletes (never denied while a consult is pending).",
+  "_about": "Pushback Gate policy. Edit by hand. Patterns are Python regexes matched case-insensitively. reviewer_by_client: for each building client, which CLI reviews (route codex|claude), the model ids to try in order, and a label. trash_tool: optional argv prefix of a trash-style delete tool used to prune old session state; reversible_delete_tools: executables treated as reversible deletes (never denied while a consult is pending). meta_patterns: talk about the review itself, which never starts or replaces one. repeat_failure_notify_command: argv of a command that receives an owner notice on stdin when the reviewer fails repeat_failure_notify_after times in a row with the same cause (at most once a day, held during notify_quiet_hours); set it in policy.local.json. binaries: optional full paths for claude and codex.",
   "reviewer_by_client": {
     "claude": {
       "route": "codex",
@@ -109,7 +109,12 @@
     "\\bjust do it\\b",
     "\\bno review\\b",
     "\\bskip (the )?review\\b",
-    "\\bwithout (a )?review\\b"
+    "\\bwithout (a )?review\\b",
+    "\\bwaive\\b",
+    "\\b(don'?t|do not|no need to|needn'?t)\\s+(bother\\s+(to\\s+)?)?(review|consult|check with)\\b",
+    "\\bskip (it|this|that|the (gate|consult|second opinion|pushback))\\b",
+    "\\bwithout (reviewing|a second opinion|the gate)\\b",
+    "\\b(no|skip the|forget the) (second opinion|pushback|gate)\\b"
   ],
   "mode_wait_patterns": [
     "\\bwait for (the |a )?review\\b",
@@ -137,7 +142,7 @@
     "\\b(add|introduce|create|build|set up|setup|implement|wire up|integrate)\\b.{0,40}\\b(dependency|dependencies|library|package|framework|table|column|schema|model|service|layer|module|abstraction|cache|caching|queue|worker|daemon|microservice|endpoint|api|interface|protocol|plugin|middleware|orm|database|db|index|pipeline|event bus|state machine)\\b",
     "\\b(use|switch to|move to|adopt|replace .{1,40} with)\\b.{0,40}\\b(library|package|framework|redis|postgres|sqlite|mongo|graphql|rest|grpc|websocket|react|vue|svelte|django|flask|fastapi|express|next\\.?js|tailwind|typescript)\\b",
     "\\b(install|npm i|npm install|pip install|brew install|cargo add|yarn add|pnpm add)\\b",
-    "\\b(schema|migration|data model|database design|architecture|architectural|global state|singleton|new abstraction|inheritance hierarchy|second (database|cache|copy))\\b",
+    "\\b(schema|migration|data model|database design|global state|singleton|new abstraction|inheritance hierarchy|second (database|cache|copy))\\b",
     "\\b(make it|make this) (generic|configurable|pluggable|extensible|reusable|async|multi-?threaded|distributed)\\b",
     "\\b(split|merge|extract|consolidate) .{0,40}\\b(module|modules|file|files|class|classes|service|services|package|packages)\\b"
   ],
@@ -407,5 +412,20 @@
   ],
   "reversible_delete_tools": [
     "safe_rm.py"
+  ],
+  "meta_patterns": [
+    "\\bpushback\\b",
+    "\\bthe gate\\b",
+    "\\bgate (review|rule|rules)\\b",
+    "\\bwaive[ds]?\\b",
+    "\\breviewer\\b",
+    "\\b(the|this|that|your) (review|consult|verdict)\\b",
+    "\\bsecond opinion\\b"
+  ],
+  "repeat_failure_notify_after": 2,
+  "repeat_failure_notify_command": null,
+  "notify_quiet_hours": [
+    0,
+    8
   ]
 }

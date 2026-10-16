@@ -25,6 +25,7 @@ import gatelib as G  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.path.join(HERE, "review_worker.py")
+WAIVE_CMD = "python3 %s waive" % shlex.quote(os.path.join(HERE, "gate.py"))
 CLIENT = "claude"
 EVENT = ""
 
@@ -38,6 +39,8 @@ def main():
         ok, note = G.restore(sys.argv[3] if len(sys.argv) > 3 else os.getcwd(), sys.argv[2])
         print(("restored: " if ok else "restore failed: ") + note)
         sys.exit(0 if ok else 1)
+    if sys.argv[1] == "waive":
+        sys.exit(waive_command(sys.argv[2:]))
     CLIENT, EVENT = sys.argv[1], sys.argv[2]
     if G.is_internal():
         return
@@ -63,10 +66,24 @@ def on_prompt(data, policy):
     sid = data.get("session_id") or "unknown"
     if not prompt.strip() or G.is_machine_prompt(prompt, policy):
         return  # not an owner prompt: no new generation, nothing superseded
+    G.flush_notices(policy)
     state = G.SessionState(CLIENT, sid)
     control = G.prompt_control(prompt)
     code_project = G.looks_like_code_project(cwd, policy)
     mode = G.detect_mode(prompt, policy)
+    about_review = G.is_about_review(prompt, policy)
+    if mode == "skip" or control == "override":
+        # The owner said, in whatever words matched, not to review: that waives the running review too.
+        def owner_waive(st):
+            prev = state.current(st)
+            if prev and (prev.get("status") in G.ACTIVE_STATUSES or G.stop_enforced(prev)):
+                ok, msg = G.apply_waiver(prev, "owner", "owner prompt: " + prompt.strip()[:160])
+                if ok:
+                    G.waivers_log("%s %s consult %s waived by owner (prompt)" % (CLIENT, sid, prev.get("gen")))
+        state.update(owner_waive)
+    if about_review and mode != "skip" and control != "override":
+        # Talking about the review never starts a new one or replaces the running one.
+        return
     decision, why = ("SKIP", "mode skip ('just do it')") if mode == "skip" else G.classify_rules(prompt, policy)
     if mode == "wait" and control not in ("cancel", "ack", "choice"):
         decision, why = "CONSULT", "explicit wait for review"
@@ -134,7 +151,7 @@ def on_prompt(data, policy):
     except Exception as e:
         G.log("worker launch failed: %r" % e)
         state.update(lambda st: G.SessionState.gen(st, gen_no).update({"status": "failed", "failure_delivered": True, "error": "launch: %r" % e}))
-        return emit_prompt_context("\n".join(extra + ["Pushback Gate: review could not start; proceeding without a second opinion. Mention this once if material to the work, without asking routine permission."]))
+        return emit_prompt_context("\n".join(extra + [failure_notice({"error": "the review could not start: %r" % e})]))
 
     rev = policy["reviewer_by_client"][CLIENT]["label"]
     head = ("Pushback Gate: this prompt is being classified; if it embodies a design decision, an independent consult (%s) "
@@ -146,6 +163,11 @@ def on_prompt(data, policy):
         "Compare the requested outcome and reviewer's goal internally; distinguish explicit constraints from casual context. "
         "Surface only a material mismatch, consequential objection, or a failure that affects the work. "
         "Platform permissions and the owner's explicit decisions still govern. "
+        "If the owner says in any words not to review this request, run `%s --by owner \"<his words, briefly>\"` and carry on; "
+        "his waiver is final. If you are confident the change is minor (small, no new dependency, no interface or data change), "
+        "you may run `%s --by agent \"<one-line reason>\"`; you may not waive a review the owner asked for or a delivered STOP. "
+        "Agent waivers are logged and the finished change is measured against them. "
+        % (WAIVE_CMD, WAIVE_CMD)
         + ("Hold edits until the verdict or the documented wait deadline." if mode == "wait" else
            "Once preparation finishes, reversible work may proceed; consequential actions wait for review.")]
     emit_prompt_context("\n".join(extra + rules))
@@ -159,11 +181,25 @@ def on_pre_tool(data, policy):
     tool = data.get("tool_name") or ""
     tool_input = data.get("tool_input") or {}
     kind = G.tool_kind(tool, tool_input, policy)
+    waive = parse_waive(G.bash_command(tool_input)) if tool in policy["shell_tools"] else None
+    if waive:
+        by, reason = waive
+        def do_waive(st):
+            g = state.current(st)
+            if not g:
+                return False, "no review in this session"
+            ok, msg = G.apply_waiver(g, by, reason)
+            if ok and g.get("waived", {}).get("at"):
+                G.waivers_log("%s %s consult %s waived by %s: %s" % (CLIENT, sid, g.get("gen"), by, reason[:200]))
+            return ok, msg
+        ok, msg = state.update(do_waive)
+        context("Pushback Gate: %s." % msg if ok else "Pushback Gate: waiver refused: %s." % msg)
+        return
 
     def decide(st):
         """Everything is decided on the live state inside the lock; returns (action, text)."""
         g = state.current(st)
-        if not g or g.get("status") in ("skipped", "superseded", None):
+        if not g or g.get("status") in ("skipped", "superseded", "waived", None):
             return None, None
         gen_no = st["generation"]
         status = g.get("status")
@@ -182,7 +218,7 @@ def on_pre_tool(data, policy):
         if status == "failed":
             if not g.get("failure_delivered"):
                 g["failure_delivered"] = True
-                return "context", "Pushback Gate: no second opinion (%s); proceeding unreviewed. Mention once if material; this is not a permission request." % g.get("error", "review failed")[:200]
+                return "context", failure_notice(g)
             return None, None
 
         if status == "done" and not g.get("delivered"):
@@ -196,7 +232,8 @@ def on_pre_tool(data, policy):
         if status == "done" and g.get("verdict") == "STOP" and enforce and not g.get("overridden"):
             if kind != "read":
                 return "deny", ("Pushback Gate: STOP verdict stands for this request (consult %d). Do not implement; present both "
-                                "sides to the owner and end with STATUS: needs-you. Reads are allowed." % gen_no)
+                                "sides to the owner and end with STATUS: needs-you. Reads are allowed. If the owner then says to go "
+                                "ahead, in any words, run `%s --by owner \"<his words>\"`." % (gen_no, WAIVE_CMD))
             return None, None
 
         if status in ("pending", "classifying", "preparing"):
@@ -242,6 +279,8 @@ def on_stop(data, policy):
     g0 = state.current()
     if not g0 or g0.get("status") in ("skipped", "superseded"):
         return
+    if g0.get("status") == "waived":
+        return audit_agent_waiver(state, policy)
     # One bounded grace sleep for a consult that is seconds from done (no polling loop, no continuation).
     if g0.get("status") == "pending" and G.now_ts() < float(g0.get("deadline") or 0):
         time.sleep(min(policy["stop_grace_seconds"], 10))
@@ -258,7 +297,7 @@ def on_stop(data, policy):
         if status == "failed" and not g.get("failure_delivered"):
             g["failure_delivered"] = True
             g["stop_blocks"] = g.get("stop_blocks", 0) + 1
-            return "block", "Pushback Gate: review failed; finish with one brief unreviewed notice if material. Do not request routine permission or restart the review."
+            return "block", failure_notice(g) + " Do not restart the review."
         if status in ("pending", "classifying", "preparing", "failed"):
             return None, None  # let the turn end; whatever arrives is shown at the next prompt
         if status != "done":
@@ -284,6 +323,121 @@ def on_stop(data, policy):
     action, text = state.update(decide)
     if action == "block":
         block_stop(text)
+
+
+def failure_notice(g):
+    return ("Pushback Gate: the second-opinion review FAILED (%s). The build continues, unreviewed. Tell the owner in one line "
+            "of your reply that this request was not reviewed and why; this is a notice, not a permission request."
+            % (g.get("error") or "unknown error")[:200])
+
+
+def audit_agent_waiver(state, policy):
+    """A builder that waived review as minor is checked against the size of what it actually changed."""
+    def decide(st):
+        g = state.current(st)
+        w = (g or {}).get("waived") or {}
+        if not g or w.get("by") != "agent" or g.get("waiver_audited"):
+            return None
+        g["waiver_audited"] = True
+        res = G.diff_check(g.get("root") or G.git_root(g.get("cwd") or "."), g.get("checkpoint") or "HEAD", "", policy)
+        g["waiver_diff"] = {"lines": res["lines"], "files": res["files"][:40], "new_deps": res["new_deps"][:10]}
+        big = res["lines"] > policy["size_bands_lines"]["small"]
+        if not big and not res["new_deps"]:
+            return None
+        G.waivers_log("%s consult %s agent waiver exceeded: %d lines, new deps %s" % (CLIENT, g.get("gen"), res["lines"], res["new_deps"][:5]))
+        why = []
+        if big:
+            why.append("%d changed lines (minor means under %d)" % (res["lines"], policy["size_bands_lines"]["small"]))
+        if res["new_deps"]:
+            why.append("possible new dependencies: %s" % ", ".join(res["new_deps"][:5]))
+        return ("Pushback Gate: you waived review as minor (%s), but the finished change has %s. Tell the owner in one line "
+                "and offer a review after the fact; do not run it unless he says so." % (w.get("reason", "")[:120], "; ".join(why)))
+    text = state.update(decide)
+    if text:
+        block_stop(text)
+
+
+def parse_waive(cmd):
+    """Recognise `gate.py waive --by owner|agent "reason"` inside a shell command."""
+    import re
+    if not cmd or not re.search(r"gate\.py['\"]?\s+waive\b", cmd):
+        return None
+    # Only an actual invocation counts (python3 .../gate.py waive ... as its own statement), never the same words
+    # inside an echo, a heredoc or a document the builder is writing.
+    for statement in G._statements(cmd):
+        toks = G._tokens(statement)
+        if len(toks) >= 2 and os.path.basename(toks[0]) == "gate.py" and toks[1] == "waive":
+            return _waive_args(toks[2:])[:2]
+        if len(toks) >= 3 and os.path.basename(toks[0]) in ("python", "python3") and os.path.basename(toks[1]) == "gate.py" and toks[2] == "waive":
+            return _waive_args(toks[3:])[:2]
+    return None
+
+
+def _waive_args(args):
+    by, reason, session, client = "agent", [], None, None
+    it = iter(args)
+    for a in it:
+        if a == "--by":
+            by = next(it, "agent")
+        elif a == "--session":
+            session = next(it, None)
+        elif a == "--client":
+            client = next(it, None)
+        else:
+            reason.append(a)
+    return by, " ".join(reason), session, client
+
+
+def waive_command(args):
+    """Standalone: gate.py waive --by owner|agent "reason" [--session ID --client claude|codex].
+    Inside a hooked session the PreToolUse hook has already applied it to the right session; this finds the most
+    recent review for the current folder otherwise."""
+    by, reason, session, client = _waive_args(args)
+    here = os.path.realpath(os.getcwd())
+    candidates = []
+    if session and client:
+        candidates = [G.SessionState(client, session)]
+    else:
+        try:
+            for name in os.listdir(G.SESSIONS_DIR):
+                st = G.SessionState("x", "x")
+                st.dir = os.path.join(G.SESSIONS_DIR, name)
+                st.path = os.path.join(st.dir, "state.json")
+                st.lock_path = os.path.join(st.dir, "state.lock")
+                g = st.current()
+                if not g:
+                    continue
+                root = os.path.realpath(g.get("root") or g.get("cwd") or "/nonexistent")
+                if here == root or here.startswith(root + os.sep) or root.startswith(here + os.sep):
+                    candidates.append((float(g.get("started_ts") or 0), st))
+        except FileNotFoundError:
+            pass
+        # A hooked session's own PreToolUse hook applies the waiver before this command runs; report that one
+        # rather than reaching for another session's review in the same folder.
+        for _, s in candidates:
+            w = (s.current() or {}).get("waived") or {}
+            if w.get("at") and time.time() - time.mktime(time.strptime(w["at"], "%Y-%m-%dT%H:%M:%SZ")) + time.timezone < 60:
+                print("review already waived by the %s" % w.get("by"))
+                return 0
+        candidates = [s for _, s in sorted(candidates, key=lambda x: x[0], reverse=True)[:1]]
+    if not candidates:
+        print("nothing to waive: no review found for %s" % here)
+        return 0
+    state = candidates[0]
+
+    def do(st):
+        g = state.current(st)
+        if not g:
+            return False, "no review found"
+        if g.get("status") == "waived":
+            return True, "review already waived by the %s" % g["waived"].get("by")
+        ok, msg = G.apply_waiver(g, by, reason)
+        if ok and g.get("waived"):
+            G.waivers_log("standalone %s consult %s waived by %s: %s" % (os.path.basename(state.dir), g.get("gen"), by, reason[:200]))
+        return ok, msg
+    ok, msg = state.update(do)
+    print(msg if ok else "waiver refused: " + msg)
+    return 0 if ok else 1
 
 
 # ---------------------------------------------------------------- rendering and replies

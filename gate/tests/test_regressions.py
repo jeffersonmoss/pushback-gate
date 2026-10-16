@@ -3,6 +3,7 @@ import contextlib, io, json, os, pathlib, subprocess, sys, tempfile, time, unitt
 from types import SimpleNamespace
 from unittest.mock import patch
 sys.dont_write_bytecode=True
+os.environ["PUSHBACK_GATE_NO_LOCAL"]="1"  # never use the machine's local policy in tests
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parents[1]))
 import gate
 import gatelib as G
@@ -69,7 +70,7 @@ class Regressions(unittest.TestCase):
                 self.assertTrue(self.denied(self.hook('PreToolUse',{'tool_name':tool,'tool_input':inp})))
             self.assertIsNone(self.hook('PreToolUse',{'tool_name':'Read','tool_input':{}}))
     def test_failure_visible_once_without_permission_request(self):
-        self.seed(status='failed',error='synthetic failure');out=self.mutation();self.assertIn('no second opinion',out['hookSpecificOutput']['additionalContext']);self.assertFalse(self.denied(out));self.assertIsNone(self.mutation())
+        self.seed(status='failed',error='synthetic failure');out=self.mutation();self.assertIn('review FAILED',out['hookSpecificOutput']['additionalContext']);self.assertFalse(self.denied(out));self.assertIsNone(self.mutation())
     def test_wrong_or_missing_goal_is_advisory(self):
         for change in [{'goal':''},{'context_status':'WRONG-REPOSITORY'},{'context_status':'UNCERTAIN'}]:
             self.seed(delivered=False,**change);self.assertFalse(self.denied(self.mutation()))

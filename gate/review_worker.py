@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gatelib as G  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+POLICY = G.load_policy()
 ROSTER = os.path.expanduser("~/.config/llm-council/roster.json")
 USAGE_BIN = os.path.expanduser("~/Library/Application Support/Codex Usage/codex-usage")
 REJECT_RE = re.compile(r"not supported|unsupported|unknown model|model.{0,40}(not found|does not exist)|invalid model|not_found", re.I)
@@ -54,6 +55,7 @@ def run(argv, stdin=None, cwd=None, timeout=600, env=None):
 def internal_env():
     env = dict(os.environ)
     env[G.INTERNAL_ENV] = "1"
+    env["PATH"] = G.widened_path(env.get("PATH"))
     return env
 
 
@@ -64,7 +66,7 @@ def classify_with_model(prompt, policy):
     if fake:
         out = fake
     else:
-        rc, out, err = run(["claude", "-p", "--model", policy["classifier_model"], "--tools", "", "--no-session-persistence",
+        rc, out, err = run([G.find_binary("claude", policy), "-p", "--model", policy["classifier_model"], "--tools", "", "--no-session-persistence",
                             "--safe-mode", "--setting-sources", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
                             "--permission-mode", "dontAsk", "--output-format", "text"], stdin=CLASSIFY_PROMPT % prompt[:6000], timeout=90, env=internal_env())
         if rc != 0 or not out.strip():
@@ -193,7 +195,8 @@ def seven_day_percent(vendor):
 
 def pick_effort(route, policy):
     vendor = "codex" if route == "codex" else "claude"
-    pct = seven_day_percent(vendor)
+    # tests feed canned verdicts; the live usage meter would only slow them down (up to 20 s per worker)
+    pct = None if os.environ.get(G.FAKE_VERDICT_ENV) else seven_day_percent(vendor)
     if pct is not None and pct >= policy["effort_low_when_seven_day_percent_at_least"]:
         return "low", pct
     return policy["effort"], pct
@@ -228,7 +231,7 @@ def call_reviewer(route, alias, brief, root, effort, outdir, gen=0, rev=None):
     if route == "codex":
         for mid in alias_chain(alias, route, rev):
             outfile = os.path.join(outdir, "answer-%d-%s-%d.out" % (gen, re.sub(r"[^\w.-]", "_", mid), int(time.time())))
-            argv = ["codex", "exec", "-p", "review", "-m", mid, "--skip-git-repo-check", "-C", root, "-o", outfile,
+            argv = [G.find_binary("codex", POLICY), "exec", "-p", "review", "-m", mid, "--skip-git-repo-check", "-C", root, "-o", outfile,
                     "-c", 'model_reasoning_effort="%s"' % effort, "-"]
             t0 = time.time()
             rc, out, err = run(argv, stdin=brief, cwd=root, timeout=600, env=internal_env())
@@ -245,7 +248,7 @@ def call_reviewer(route, alias, brief, root, effort, outdir, gen=0, rev=None):
         return "", None, "; ".join(notes)
     # claude route: Opus with read-only tools in the repository
     model = (alias_chain(alias, route, rev) or [alias])[0]
-    argv = ["claude", "-p", "--model", model, "--tools", "Read,Grep,Glob", "--effort", effort, "--no-session-persistence",
+    argv = [G.find_binary("claude", POLICY), "-p", "--model", model, "--tools", "Read,Grep,Glob", "--effort", effort, "--no-session-persistence",
             "--safe-mode", "--allowedTools", "Read,Grep,Glob", "--permission-mode", "dontAsk",
             "--output-format", "text", "--setting-sources", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
     t0 = time.time()
@@ -341,6 +344,7 @@ def main():
         if gg.get("status") != "superseded":
             gg["status"] = "done"
     state.update(publish)
+    G.record_review_outcome(client, rev["label"], bool(text.strip()), notes, policy)
     G.log("%s consult %d: %s by %s in %ds%s" % (client, gen, parsed["verdict"] or ("FAILED " + notes[:80]), model, secs,
                                               "" if current else " (superseded)"))
     G.prune_old_sessions(policy["session_state_days"])

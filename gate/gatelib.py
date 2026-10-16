@@ -17,6 +17,7 @@ import time
 import tempfile
 import uuid
 import shutil
+import socket
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -50,8 +51,192 @@ def log(msg):
 
 
 def load_policy():
+    """policy.json, with policy.local.json (machine-specific, never published) merged over it when present."""
     with open(POLICY_PATH) as f:
-        return json.load(f)
+        policy = json.load(f)
+    local = os.path.join(os.path.dirname(POLICY_PATH), "policy.local.json")
+    if os.path.exists(local) and not os.environ.get("PUSHBACK_GATE_POLICY_PATH") and os.environ.get("PUSHBACK_GATE_NO_LOCAL") != "1":
+        try:
+            with open(local) as f:
+                policy.update(json.load(f))
+        except Exception as e:
+            log("policy.local.json ignored: %r" % e)
+    return policy
+
+
+# Hooks can run with a minimal PATH (Codex hooks were seen without ~/.local/bin), so the reviewer CLIs are
+# looked up by full path and the worker's PATH is widened before anything is launched.
+EXTRA_BIN_DIRS = ["~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin", "~/.npm-global/bin", "~/.bun/bin", "~/bin",
+                  "/usr/bin", "/bin"]
+
+
+def widened_path(path=None):
+    parts = [p for p in (path if path is not None else os.environ.get("PATH", "")).split(os.pathsep) if p]
+    for d in EXTRA_BIN_DIRS:
+        d = os.path.expanduser(d)
+        if d not in parts and os.path.isdir(d):
+            parts.append(d)
+    return os.pathsep.join(parts)
+
+
+def find_binary(name, policy=None):
+    """Full path to a CLI: policy "binaries" override, then PATH, then the usual install folders."""
+    configured = ((policy or {}).get("binaries") or {}).get(name)
+    candidates = [configured] if configured else []
+    found = shutil.which(name, path=widened_path())
+    if found:
+        candidates.append(found)
+    for c in candidates:
+        c = os.path.expanduser(c)
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return name
+
+
+# ---------------------------------------------------------------- waivers and failure notices
+
+def waivers_log(line):
+    try:
+        os.makedirs(STATE_ROOT, exist_ok=True)
+        with open(os.path.join(STATE_ROOT, "waivers.log"), "a") as f:
+            f.write("%s %s\n" % (now_iso(), line))
+    except Exception:
+        pass
+
+
+ACTIVE_STATUSES = ("classifying", "preparing", "pending")
+
+
+def apply_waiver(g, by, reason):
+    """Waive the review for one generation. Returns (ok, message). The owner's waiver always wins; the builder's
+    waiver (by="agent") is refused when the owner asked for the review (wait mode) or a STOP has been delivered."""
+    if by not in ("owner", "agent"):
+        return False, "--by must be owner or agent"
+    status = g.get("status")
+    if status in ("skipped", "superseded", "waived", None):
+        return True, "nothing to waive (review %s)" % (status or "absent")
+    if by == "agent":
+        if g.get("mode") == "wait":
+            return False, "the owner asked for this review; only the owner can waive it"
+        if g.get("verdict") == "STOP" and stop_enforced(g):
+            return False, "a STOP verdict stands; only the owner can waive it"
+    g["waived"] = {"by": by, "reason": (reason or "").strip()[:300], "at": now_iso(), "prior_status": status}
+    g["status"] = "waived"
+    g["released"] = True
+    if by == "owner":
+        g["overridden"] = True
+    return True, "review waived by the %s" % by
+
+
+def failure_signature(error):
+    """Same cause, same signature: digits, paths and quoted fragments removed."""
+    e = (error or "").lower()
+    e = re.sub(r"(/[^\s'\"]+)+", "<path>", e)
+    e = re.sub(r"\d+", "#", e)
+    e = re.sub(r"\s+", " ", e)
+    return e.strip()[:160]
+
+
+def likely_fix(error):
+    e = (error or "").lower()
+    if re.search(r"not logged in|log ?in|sign ?in|auth|unauthori[sz]ed|\b401\b|expired|credential|keychain", e):
+        return "It looks like a sign-in problem: sign in to that CLI again on this Mac."
+    if re.search(r"no such file|not found|filenotfound|enoent", e):
+        return "It looks like the reviewer program was not found: check where it is installed."
+    if re.search(r"rate limit|usage limit|quota|\b429\b", e):
+        return "It looks like a usage limit: it should clear when the limit resets."
+    return "See ~/.local/state/pushback_gate/gate.log for the error."
+
+
+def _streak_path():
+    return os.path.join(STATE_ROOT, "failure-streak.json")
+
+
+def _read_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _write_json(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp-%d" % os.getpid()
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=1)
+    os.replace(tmp, path)
+
+
+def record_review_outcome(client, label, ok, error, policy):
+    """Track consecutive reviewer failures per client. The second consecutive failure with the same cause queues
+    one owner notification (at most once per day); a success resets the streak."""
+    try:
+        os.makedirs(STATE_ROOT, exist_ok=True)
+        with open(os.path.join(STATE_ROOT, ".streak.lock"), "a+") as lk:
+            _flock_timeout(lk, 3)
+            streaks = _read_json(_streak_path(), {})
+            s = streaks.get(client, {})
+            if ok:
+                streaks[client] = {"count": 0, "last_notified": s.get("last_notified"), "last_notified_ts": s.get("last_notified_ts", 0)}
+                _write_json(_streak_path(), streaks)
+                return
+            sig = failure_signature(error)
+            count = s.get("count", 0) + 1 if s.get("signature") == sig else 1
+            s.update({"signature": sig, "count": count, "last_error": (error or "")[:300], "last_failed": now_iso()})
+            needed = int(policy.get("repeat_failure_notify_after", 2))
+            last = s.get("last_notified_ts", 0)
+            if count >= needed and now_ts() - last > 86400 and policy.get("repeat_failure_notify_command"):
+                msg = ("Pushback Gate on %s: the %s reviewer has failed %d times in a row with the same error, so builds "
+                       "from %s are running unreviewed. %s" % (socket.gethostname().split(".")[0], label, count,
+                                                              "Codex" if client == "codex" else "Claude Code", likely_fix(error)))
+                _write_json(os.path.join(STATE_ROOT, "pending-notice-%s.json" % client), {"message": msg, "queued": now_iso()})
+                s["last_notified_ts"] = now_ts()
+                s["last_notified"] = now_iso()
+            streaks[client] = s
+            _write_json(_streak_path(), streaks)
+    except Exception as e:
+        log("failure streak update failed: %r" % e)
+    flush_notices(policy)
+
+
+def in_quiet_hours(policy, when=None):
+    start, end = policy.get("notify_quiet_hours") or [0, 0]
+    if start == end:
+        return False
+    h = time.localtime(when or now_ts()).tm_hour
+    return (start <= h < end) if start < end else (h >= start or h < end)
+
+
+def flush_notices(policy):
+    """Send queued owner notifications unless it is quiet time; called from the worker and from each prompt."""
+    cmd = policy.get("repeat_failure_notify_command")
+    if not cmd or in_quiet_hours(policy):
+        return
+    try:
+        names = [n for n in os.listdir(STATE_ROOT) if n.startswith("pending-notice-") and n.endswith(".json")]
+    except Exception:
+        return
+    for n in names:
+        path = os.path.join(STATE_ROOT, n)
+        notice = _read_json(path, None)
+        if not notice:
+            continue
+        try:
+            r = subprocess.run([os.path.expanduser(a) for a in cmd], input=notice["message"], text=True,
+                               capture_output=True, timeout=30, env=dict(os.environ, PATH=widened_path()))
+            if r.returncode == 0:
+                os.unlink(path)
+                log("owner notified: %s" % notice["message"][:120])
+            else:
+                log("owner notice failed (%d): %s" % (r.returncode, (r.stderr or r.stdout)[-200:]))
+        except Exception as e:
+            log("owner notice failed: %r" % e)
+
+
+def is_about_review(prompt, policy):
+    """Talk about the gate or the review itself: never starts or replaces a review."""
+    return bool(_any(policy.get("meta_patterns", []), _strip_quotes(prompt)))
 
 
 def is_internal():
@@ -453,6 +638,9 @@ def classify_rules(prompt, policy):
     stripped = re.sub(r"^\s*(?:(?:can|could|would|will) you\s+)?(?:please\s+)?", "", stripped, flags=re.I)
     first = stripped.split("\n", 1)[0].strip()
     if first.endswith("?") and len(first.split()) <= 40 and not _any(policy["imperative_patterns"], first):
+        return "SKIP", "question"
+    if stripped.rstrip().endswith("?") and not _any(policy["imperative_patterns"], stripped):
+        # A message that ends by asking something, and does not open with a build verb, is addressed to the agent.
         return "SKIP", "question"
     hit = _any(policy["consult_patterns"], stripped)
     skip = _any(policy["skip_patterns"], stripped)

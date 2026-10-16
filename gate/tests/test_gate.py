@@ -21,6 +21,7 @@ sys.path.insert(0, ROOT)
 import gatelib as G  # noqa: E402
 
 PREFIX = "pbg-test-"
+os.environ["PUSHBACK_GATE_NO_LOCAL"] = "1"  # tests never use the machine's local policy (it can send real notices)
 TMP = tempfile.gettempdir()
 
 
@@ -391,7 +392,7 @@ class TestGate(unittest.TestCase):
                     PUSHBACK_GATE_FAKE_VERDICT=os.path.join(self.h.fake_dir, "missing.md"))
         g = self.h.wait_status({"failed"})
         self.assertIn("missing", g["error"])
-        self.assertIn("review failed", self.h.hook("Stop", {"stop_hook_active": False})["reason"])
+        self.assertIn("review FAILED", self.h.hook("Stop", {"stop_hook_active": False})["reason"])
         self.assertIsNone(self.h.hook("Stop", {"stop_hook_active": True}))
 
     def test_codex_client_same_contract(self):

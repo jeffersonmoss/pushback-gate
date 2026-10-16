@@ -6,7 +6,7 @@ The builder compares the requested outcome, explicit constraints, and reviewer's
 
 ## How it works
 
-1. `UserPromptSubmit` classifies the request. Clear questions, routine fixes, acknowledgements, and cancellations skip review. Short or politely phrased implementation requests can still trigger it. A small model classifies ambiguous requests.
+1. `UserPromptSubmit` classifies the request. Questions (a message ending in a question mark that does not open with a build verb), routine fixes, acknowledgements, and cancellations skip review. Messages about the review itself (the gate, the reviewer, a waiver, a second opinion) never start or replace one, so the owner can talk about the gate in any words. Short or politely phrased implementation requests can still trigger it. A small model classifies ambiguous requests.
 2. Before consequential edits, the gate records a working-tree checkpoint in an existing Git repository. Reads remain available during classification and checkpoint preparation. The gate does not initialize repositories by default.
 3. A detached worker sends the request, recent owner context, and capped repository evidence to the other vendor's CLI. Claude Code builds use Codex; Codex builds use Claude Code. The reviewer has read-only tools.
 4. `PreToolUse` delivers the verdict and enforces any applicable hold. `GO` requires no public ceremony. `GO-WITH-NOTES` carries material implementation advice. A timely, context-matched `STOP` pauses mutations so the owner can decide.
@@ -18,7 +18,9 @@ The builder compares the requested outcome, explicit constraints, and reviewer's
 - Explicit “review this first” requests use wait mode and hold non-read tools until a verdict or the 240-second deadline. The default arrival deadline is 180 seconds.
 - A STOP received before its deadline persists until the request is cancelled, replaced, or explicitly overridden. “Thanks” does not erase it; after the objection is delivered, ordinary decision replies such as “yes” or “go ahead” resolve the hold. Questions about the objection do not authorize implementation.
 - The builder interprets ordinary replies in the conversation; no special override phrase is required. An informed instruction such as “I accept the tradeoff; proceed” or “do it anyway” overrides the gate. A new substantive correction starts a new generation. “Just do it” and “skip the review” remain explicit review bypasses.
-- A verdict arriving after release is advisory. Worker failure permits progress with one brief notice that there was no second opinion. Gate exceptions fail open and are logged.
+- **Waivers.** The owner can waive a review in any words. The builder reads the intent and runs `gate.py waive --by owner "<his words>"`, which releases the review and its holds at once; common phrasings ("waive it", "don't review this", "skip it") are also recognised directly. The builder may waive a review it is confident is minor with `gate.py waive --by agent "<reason>"`, but not one the owner asked for and not a delivered STOP. Agent waivers are logged in the state folder's `waivers.log`, and at turn end the actual change is measured: over 80 changed lines or a possible new dependency is flagged to the owner with an offer to review after the fact.
+- A verdict arriving after release is advisory. A failed review never blocks the build, but it is loud: the builder is told the review failed and why, and must say so to the owner in one line. When the same cause fails twice in a row (a broken install or an expired sign-in rather than a blip), the gate can send one owner notice through a command you configure in `policy.local.json` (`repeat_failure_notify_command`, receives the text on stdin), at most once a day and held during `notify_quiet_hours`. Gate exceptions fail open and are logged.
+- Hooks can run with a minimal `PATH` (Codex hooks were seen without `~/.local/bin`), so the reviewer CLIs are found by full path; set `binaries` in the policy if yours live somewhere unusual.
 - A missing goal, uncertain repository, or tool target outside the reviewed repository cannot receive an architectural veto from that review. Semantic goal alignment still depends on model judgment.
 
 ## Checkpoints and restore
@@ -45,7 +47,7 @@ Disable with `PUSHBACK_GATE_DISABLED=1` for a shell or `"enabled": false` in the
 
 ## Validation and limits
 
-The deterministic suites are `gate/tests/test_gate.py` and `gate/tests/test_regressions.py`. Run them in a disposable filesystem sandbox with network denied, a dedicated temporary directory, and writes restricted to that directory. They exercise real Git restores and clean up their own fixtures. They use fake model answers and cannot establish reviewer quality.
+The deterministic suites are `gate/tests/test_gate.py`, `gate/tests/test_regressions.py` and `gate/tests/test_waivers.py`. Run them in a disposable filesystem sandbox with network denied, a dedicated temporary directory, and writes restricted to that directory. They exercise real Git restores and clean up their own fixtures. They use fake model answers and cannot establish reviewer quality.
 
 Live evaluation must assess both useful objections and false alarms. Include a justified change, a harmful proposal, an informed tradeoff, casual context, cancellation, and small requests. Keep fixture expectations out of the reviewer prompt. Test actual tool delivery separately from response-only experiments.
 
