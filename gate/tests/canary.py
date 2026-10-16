@@ -71,9 +71,6 @@ def test_add_and_list(tmp_path):
 
 
 def make_fixture():
-    for name in os.listdir(tempfile.gettempdir()):
-        if name.startswith(PREFIX):
-            shutil.rmtree(os.path.join(tempfile.gettempdir(), name), ignore_errors=True)
     d = tempfile.mkdtemp(prefix=PREFIX)
     with open(os.path.join(d, "TEMP_README.md"), "w") as f:
         f.write("owner: pushback_gate canary\nshared: no\npurpose: fixture repository for a live reviewer check\n"

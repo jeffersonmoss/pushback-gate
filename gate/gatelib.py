@@ -14,10 +14,14 @@ import shlex
 import subprocess
 import sys
 import time
+import tempfile
+import uuid
+import shutil
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-POLICY_PATH = os.path.join(HERE, "policy.json")
+POLICY_PATH = os.environ.get("PUSHBACK_GATE_POLICY_PATH") or os.path.join(HERE, "policy.json")
 STATE_ROOT = os.environ.get("PUSHBACK_GATE_STATE_ROOT") or os.path.expanduser("~/.local/state/pushback_gate")
 SESSIONS_DIR = os.path.join(STATE_ROOT, "sessions")
 LOG_PATH = os.path.join(STATE_ROOT, "gate.log")
@@ -147,7 +151,7 @@ def prune_old_sessions(days):
 def git(args, cwd, timeout=15, env=None):
     try:
         r = subprocess.run(["git"] + args, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
-        return r.returncode, r.stdout.strip(), r.stderr.strip()
+        return r.returncode, r.stdout.rstrip("\n"), r.stderr.strip()
     except subprocess.TimeoutExpired:
         return 124, "", "git %s timed out after %ss" % (args[0], timeout)
     except Exception as e:
@@ -219,11 +223,13 @@ def checkpoint(cwd, label, policy):
     """Snapshot the working tree (tracked, modified and untracked-but-not-ignored files) as a commit on a
     dedicated ref, without touching the user's index or branch. Returns (sha_or_None, ref_or_None, note).
 
-    Restoring is one step: `git checkout <sha> -- .` (plus `git clean -fd` for files that did not exist).
-    A folder without git gets `git init` unless it is cloud-synced (Drive mishandles .git)."""
+    Restore only through restore(), which preserves a complete recovery checkpoint first.
+    Repository creation is opt-in; ignored files and submodule contents are not covered."""
     root = git_root(cwd)
     note = ""
     if not root:
+        if not policy.get("initialize_missing_repository", False):
+            return None, None, "no checkpoint: this folder has no repository (automatic git init is disabled)"
         if is_cloud_synced(cwd, policy):
             return None, None, "no checkpoint: folder is cloud-synced and has no git repository"
         rc, _, err = git(["init", "-q"], cwd)
@@ -249,9 +255,20 @@ def checkpoint(cwd, label, policy):
         return None, None, note + "another session is checkpointing this repository"
 
 
+@contextmanager
+def temporary_index():
+    os.makedirs(STATE_ROOT, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="pushback-index-", dir=STATE_ROOT) as directory:
+        yield os.path.join(directory, "index")
+
+
 def _checkpoint_locked(root, label, note, budget):
+    with temporary_index() as index:
+        return _write_checkpoint(root, label, note, budget, index)
+
+
+def _write_checkpoint(root, label, note, budget, tmp_index):
     env = dict(os.environ)
-    tmp_index = os.path.join(root, ".git", "pushback-gate-index-%d" % os.getpid())
     env["GIT_INDEX_FILE"] = tmp_index
     try:
         rc, head, _ = git(["rev-parse", "--verify", "-q", "HEAD"], root)
@@ -262,11 +279,7 @@ def _checkpoint_locked(root, label, note, budget):
                 return None, None, note + "read-tree failed: %s" % err[:120]
         rc, _, err = git(["add", "-A", "--", "."], root, timeout=max(3, int(budget)), env=env)
         if rc != 0:
-            # Drive folders and odd filenames can defeat add -A; fall back to tracked files only.
-            rc2, _, err2 = git(["add", "-u", "--", "."], root, timeout=max(3, int(budget / 2)), env=env)
-            if rc2 != 0:
-                return None, None, note + "git add failed: %s" % (err or err2)[:160]
-            note += "untracked files not covered (%s); " % err.splitlines()[0][:80] if err else "untracked files not covered; "
+            return None, None, note + "complete checkpoint failed: %s" % err[:160]
         rc, tree, err = git(["write-tree"], root, timeout=10, env=env)
         if rc != 0:
             return None, None, note + "write-tree failed: %s" % err[:120]
@@ -277,8 +290,10 @@ def _checkpoint_locked(root, label, note, budget):
         rc, sha, err = git(args, root, timeout=10)
         if rc != 0 or not sha:
             return None, None, note + "commit-tree failed: %s" % err[:120]
-        ref = "refs/pushback-gate/%s" % re.sub(r"[^A-Za-z0-9_-]", "-", label)
-        git(["update-ref", ref, sha], root, timeout=10)
+        ref = "refs/pushback-gate/%s-%s" % (re.sub(r"[^A-Za-z0-9_-]", "-", label), uuid.uuid4().hex)
+        rc, _, err = git(["update-ref", ref, sha], root, timeout=10)
+        if rc != 0:
+            return None, None, note + "checkpoint retention failed: %s" % err[:160]
         return sha, ref, note + "checkpoint %s on %s" % (sha[:10], ref)
     finally:
         try:
@@ -294,37 +309,83 @@ def restore(cwd, target):
     root = git_root(cwd)
     if not root:
         return False, "not a git repository: %s" % cwd
-    rc, sha, err = git(["rev-parse", "--verify", "-q", target + "^{commit}"], root)
+    try:
+        with open(_repo_lock_path(root), "a+") as lk:
+            _flock_timeout(lk, 5)
+            try:
+                return _restore_locked(root, target)
+            finally:
+                fcntl.flock(lk, fcntl.LOCK_UN)
+    except Exception as e:
+        return False, "restore refused or interrupted: %s" % e
+
+
+def _restore_locked(root, target):
+    # No working-tree writes occur until a retained recovery snapshot and path checks succeed.
+    rc, sha, err = git(["rev-parse", "--verify", "-q", "--end-of-options", target + "^{commit}"], root)
     if rc != 0 or not sha:
         return False, "no such checkpoint: %s" % target
+    rc, tree, err = git(["ls-tree", "-rz", sha], root, timeout=30)
+    if rc != 0:
+        return False, "cannot inspect target: " + err[:160]
+    entries = [x for x in tree.split("\0") if x]
+    if any(not x.startswith(("100644 ", "100755 ")) for x in entries):
+        return False, "restore refuses symlinks or submodules in the target; restore manually with a backup"
+    paths = [x.split("\t", 1)[1] for x in entries]
+    recovery, recovery_ref, note = _checkpoint_locked(root, "before-restore", "", 30)
+    if not recovery:
+        return False, "restore aborted; unable to preserve current tree: " + note
+    recovery_note = "; recovery snapshot %s (%s); ignored files and submodule contents are outside coverage" % (recovery, recovery_ref)
+    rc, previous, err = git(["ls-tree", "-rz", recovery], root, timeout=30)
+    if rc != 0:
+        return False, "cannot inspect recovery snapshot" + recovery_note
+    old_entries = [x for x in previous.split("\0") if x]
+    if any(not x.startswith(("100644 ", "100755 ")) for x in old_entries):
+        return False, "restore refuses current symlinks or submodules" + recovery_note
+    old_paths = [x.split("\t", 1)[1] for x in old_entries]
+    for rel in set(paths + old_paths):
+        full = os.path.join(root, rel)
+        if not os.path.realpath(full).startswith(os.path.realpath(root) + os.sep):
+            return False, "unsafe path in restore: %s" % rel + recovery_note
+        cur = full
+        while cur != root:
+            if os.path.islink(cur):
+                return False, "restore refuses symlink path: %s" % rel + recovery_note
+            cur = os.path.dirname(cur)
+        if os.path.isdir(full) or (os.path.lexists(full) and rel not in old_paths):
+            return False, "restore refuses directory or uncovered/ignored collision: %s" % rel + recovery_note
+    with temporary_index() as index:
+        return _restore_files(root, sha, paths, old_paths, index, recovery_note)
+
+
+def _restore_files(root, sha, paths, old_paths, tmp_index, recovery_note):
     env = dict(os.environ)
-    tmp_index = os.path.join(root, ".git", "pushback-gate-restore-index-%d" % os.getpid())
     env["GIT_INDEX_FILE"] = tmp_index
     try:
         rc, _, err = git(["read-tree", sha], root, timeout=30, env=env)
         if rc != 0:
-            return False, "read-tree failed: %s" % err[:160]
+            return False, "read-tree failed: %s" % err[:160] + recovery_note
         rc, _, err = git(["checkout-index", "-a", "-f"], root, timeout=120, env=env)
         if rc != 0:
-            return False, "checkout-index failed: %s" % err[:160]
-        rc, snap, _ = git(["ls-tree", "-r", "--name-only", sha], root, timeout=30)
-        rc2, now, _ = git(["ls-files", "--cached", "--others", "--exclude-standard"], root, timeout=30)
-        extra = sorted(set(now.splitlines()) - set(snap.splitlines()))
+            return False, "checkout-index failed (tree may be partially restored): %s" % err[:160] + recovery_note
+        extra = sorted(set(old_paths) - set(paths))
         moved = []
         if extra:
-            dest = os.path.join(STATE_ROOT, "restore-leftovers", time.strftime("%Y-%m-%d-%H%M%S") + "-" + sha[:8])
+            dest = os.path.join(STATE_ROOT, "restore-leftovers", uuid.uuid4().hex)
             for rel in extra:
                 src = os.path.join(root, rel)
                 if not os.path.isfile(src):
                     continue
                 dst = os.path.join(dest, rel)
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
-                os.replace(src, dst)
+                shutil.move(src, dst)
                 moved.append(rel)
-        note = "restored %d files from %s" % (len(snap.splitlines()), sha[:10])
+        note = "restored %d files from %s" % (len(paths), sha)
         if moved:
             note += "; %d files that the snapshot did not contain were moved to %s" % (len(moved), dest)
-        return True, note
+        return True, note + recovery_note
+    except Exception as e:
+        return False, "restore interrupted (tree may be partially restored): %s" % e + recovery_note
     finally:
         try:
             os.unlink(tmp_index)
@@ -342,12 +403,31 @@ def _any(patterns, text):
 
 
 def _strip_quotes(text):
-    return re.sub(r'"[^"\n]*"|\'[^\'\n]*\'|“[^”\n]*”', '""', text)
+    return re.sub(r'''"[^"\n]*"|(?<!\w)'[^'\n]*'(?!\w)|“[^”\n]*”''', '""', text)
 
 
 def is_machine_prompt(prompt, policy):
     """System notifications, task notifications, app-generated suggestions and the gate's own briefs."""
-    return INTERNAL_SENTINEL in prompt or bool(_any(policy["machine_prompt_patterns"], prompt[:400]))
+    return prompt.lstrip().split("\n", 1)[0].strip() == INTERNAL_SENTINEL or bool(_any(policy["machine_prompt_patterns"], prompt[:400]))
+
+
+def prompt_control(prompt):
+    text = _strip_quotes(prompt).strip().lower().rstrip(".! ")
+    if re.fullmatch(r"(?:please )?(?:cancel|stop|never mind|nevermind|hold on|scrap that)(?: (?:that|this|the|change|task|work|immediately|now|please))*", text):
+        return "cancel"
+    if re.fullmatch(r"(?:thanks|thank you|got it|understood)", text):
+        return "ack"
+    if re.fullmatch(r"(?:ok|okay|yeah|yes|no|nope|sure|continue|proceed|go ahead|carry on|do it)", text):
+        return "choice"
+    if re.fullmatch(r"(?:yes[, ]+)?(?:do it anyway|proceed anyway|go ahead anyway|ignore (?:the )?(?:review|objection))", text) or (re.search(r"\b(?:read|understand|accept|acknowledge)\b.{0,50}\b(?:objection|risk|tradeoff|trade-off)\b", text) and re.search(r"\b(?:proceed|go ahead|do it)\b", text)):
+        return "override"
+    return None
+
+
+def stop_enforced(g):
+    return (g.get("status") == "done" and g.get("verdict") == "STOP" and not g.get("late")
+            and not g.get("released") and not g.get("overridden") and bool(g.get("goal"))
+            and g.get("context_status", "MATCH") == "MATCH")
 
 
 def detect_mode(prompt, policy):
@@ -367,18 +447,26 @@ def detect_mode(prompt, policy):
 def classify_rules(prompt, policy):
     """Returns ('SKIP'|'CONSULT'|'AMBIGUOUS', reason). Questions and quoted text never consult."""
     text = prompt.strip()
-    if len(text) < 12:
-        return "SKIP", "very short prompt"
-    hit = _any(policy["skip_patterns"], text)
-    if hit:
-        return "SKIP", "rule: %s" % hit[:60]
+    if prompt_control(text) in ("cancel", "ack", "choice", "override"):
+        return "SKIP", "conversation control"
     stripped = _strip_quotes(text)
+    stripped = re.sub(r"^\s*(?:(?:can|could|would|will) you\s+)?(?:please\s+)?", "", stripped, flags=re.I)
     first = stripped.split("\n", 1)[0].strip()
     if first.endswith("?") and len(first.split()) <= 40 and not _any(policy["imperative_patterns"], first):
         return "SKIP", "question"
     hit = _any(policy["consult_patterns"], stripped)
+    skip = _any(policy["skip_patterns"], stripped)
+    # Genuine informational questions remain read-only; mixed action clauses do not disappear.
+    if skip and re.match(r"^(?:explain|describe|summari[sz]e|what does|tell me|show me)\b", stripped, re.I) and not re.search(r"\b(?:then|and)\s+(?:add|install|rewrite|migrate|delete|deploy)\b", stripped, re.I):
+        return "SKIP", "informational request"
+    if not re.search(r"\b(?:then|and)\s+(?:add|install|rewrite|migrate|delete|deploy|implement|build|create|replace|switch|refactor)\b", stripped, re.I) and re.match(r"^(?:(?:fix|correct) (?:the |a )?(?:typo|spelling|wording|comment|docstring|formatting|indentation|lint)|(?:run|execute|rerun|re-run) (?:the )?.*\b(?:tests?|build|linter|suite)\b|(?:update|bump) (?:the )?(?:readme|docs?|documentation|changelog|version)\b|(?:commit|push|stage|git (?:commit|push|status|log|diff))\b|(?:read|look at|inspect|review|audit|compare|evaluate|assess)\b)", stripped, re.I):
+        return "SKIP", "bounded read-only or routine request"
     if hit:
         return "CONSULT", "rule: %s" % hit[:60]
+    if skip:
+        return "SKIP", "rule: %s" % skip[:60]
+    if len(text) < 12:
+        return "SKIP", "very short nonconsequential prompt"
     if len(stripped.split()) <= 8 and "?" in stripped:
         return "SKIP", "short question"
     return "AMBIGUOUS", "no rule matched"
@@ -431,6 +519,28 @@ def _statement_kind(statement, policy):
     if not toks:
         return "other"
     exe = os.path.basename(toks[0])
+    if "$ (".replace(" ", "") in statement or "`" in statement:
+        return "other"  # command substitution can execute effects hidden in a read command
+    if exe in ("sh", "bash", "zsh", "dash", "ksh"):
+        for i, token in enumerate(toks[1:], 1):
+            if token.startswith("-") and "c" in token[1:]:
+                return bash_kind(toks[i + 1], policy) if i + 1 < len(toks) else "other"
+        return "other"
+    if exe == "git":
+        args = toks[1:]
+        while args and args[0].startswith("-"):
+            opt = args.pop(0)
+            if opt in ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"):
+                if not args:
+                    return "other"
+                args.pop(0)
+            elif opt in ("--no-pager", "--paginate", "-p", "-P", "--no-optional-locks", "--bare") or opt.startswith(("--git-dir=", "--work-tree=", "--namespace=", "--config-env=", "-C", "-c")):
+                pass
+            elif opt in ("--version", "--help"):
+                return "read"
+            else:
+                return "other"
+        toks = [toks[0]] + args
     if exe in ("xargs", "parallel") and len(toks) > 1:
         rest = [t for t in toks[1:] if not t.startswith("-")]
         return _statement_kind(" ".join(shlex.quote(t) for t in rest), policy) if rest else "other"
@@ -454,13 +564,15 @@ def _statement_kind(statement, policy):
         if sub in subs or ("%s %s" % (sub, sub2)) in subs:
             return "irreversible"
     if exe == "git":
-        if sub in rules.get("git_subcommands", []):
+        if sub in rules.get("git_subcommands", []) or (sub + " " + sub2) in rules.get("git_subcommands", []) or sub == "reset":
             return "irreversible"
         if sub in ("checkout", "restore") and ("--" in toks or sub == "restore" and "--source" in joined):
             return "irreversible"
         if sub in ("commit", "add", "stash", "tag", "merge", "cherry-pick", "revert", "switch"):
             return "edit"
-        return "read"
+        if re.search(r"(^|\s)(>|>>)\s*\S", statement):
+            return "edit"
+        return "read" if sub in ("status", "log", "diff", "show", "rev-parse", "ls-files", "ls-tree", "cat-file", "for-each-ref", "grep", "blame", "describe", "shortlog") else "other"
     if exe in rules.get("sql_clients", []) and re.search(r"\b(DROP\s+(TABLE|DATABASE)|TRUNCATE\s+TABLE|DELETE\s+FROM)\b", statement, re.I):
         return "irreversible"  # for a database client the SQL legitimately sits inside quotes
     if re.search(r"(^|\s)(>|>>)\s*\S", statement) or exe in ("tee", "mv", "cp", "mkdir", "touch", "patch", "ln", "chmod", "chown"):
@@ -506,12 +618,12 @@ def tool_kind(tool_name, tool_input, policy):
 # ---------------------------------------------------------------- verdict parsing
 
 VERDICT_RE = re.compile(r"^\s*VERDICT\s*:\s*(GO-WITH-NOTES|GO|STOP)\s*$", re.I | re.M)
-SECTION_RE = re.compile(r"^(REASON|GOAL|NOTES|SHAPE)\s*:\s*", re.I | re.M)
+SECTION_RE = re.compile(r"^(REASON|GOAL|CONTEXT|NOTES|SHAPE)\s*:\s*", re.I | re.M)
 
 
 def parse_verdict(text):
     """Strict: the VERDICT line must be exactly one token. Anything else is UNPARSED (advisory only)."""
-    out = {"verdict": None, "reason": "", "goal": "", "notes": "", "shape": "", "raw": text or ""}
+    out = {"verdict": None, "reason": "", "goal": "", "context": "MATCH", "notes": "", "shape": "", "raw": text or ""}
     if not text:
         return out
     m = VERDICT_RE.search(text)
@@ -521,6 +633,8 @@ def parse_verdict(text):
     for i, (start, end, name) in enumerate(positions):
         stop = positions[i + 1][0] if i + 1 < len(positions) else len(text)
         out[name] = text[end:stop].strip()
+    context_token = re.match(r"[A-Za-z-]+", out["context"])
+    out["context"] = context_token.group(0).upper() if context_token else "UNCERTAIN"
     return out
 
 
@@ -563,16 +677,27 @@ def diff_check(root, checkpoint_sha, shape_text, policy):
         return res
     rc, out, _ = git(["diff", "--numstat", checkpoint_sha], root)
     rc2, untracked, _ = git(["ls-files", "--others", "--exclude-standard"], root)
-    files, lines = [], 0
+    rc3, checkpoint_files, _ = git(["ls-tree", "-rz", checkpoint_sha], root)
+    known = {x.split("\t", 1)[1]: x.split()[2] for x in checkpoint_files.split("\0") if "\t" in x} if rc3 == 0 else {}
+    files, lines, line_counts = [], 0, {}
     if rc == 0:
         for line in out.splitlines():
             parts = line.split("\t")
             if len(parts) == 3:
                 a, d, f = parts
                 files.append(f)
-                lines += (int(a) if a.isdigit() else 0) + (int(d) if d.isdigit() else 0)
+                line_counts[f] = (int(a) if a.isdigit() else 0) + (int(d) if d.isdigit() else 0)
+                lines += line_counts[f]
     if rc2 == 0:
         for f in untracked.splitlines():
+            if f in known:
+                rh, blob, _ = git(["hash-object", "--", f], root)
+                if rh == 0 and blob == known[f]:
+                    # git diff compares against the live index, where a checkpoint's untracked file is absent.
+                    if f in files:
+                        files.remove(f)
+                        lines -= line_counts.get(f, 0)
+                    continue
             if f and f not in files:
                 files.append(f)
                 try:

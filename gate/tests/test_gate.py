@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 """Pushback Gate tests. No model calls: the worker is fed canned verdicts.
 
-Run plainly:  python3 tests/test_gate.py
-The code under test deletes nothing (the gate only reads, snapshots and writes state), so the owner's
-sandbox rule for destructive tests does not apply; the sandbox also cannot delete git objects, which every
-test repo contains. The harness's own cleanup is confined by construction: close() refuses any path that is
-not its own prefixed folder under the session temp dir, and it joins its detached workers first.
+Run only in a disposable filesystem sandbox with network disabled and writes confined to its own temp root.
+The suite exercises restores and deletes its owned test fixtures.
 """
 import json
 import os
@@ -27,12 +24,6 @@ PREFIX = "pbg-test-"
 TMP = tempfile.gettempdir()
 
 
-def cleanup_stale():
-    for name in os.listdir(TMP):
-        if name.startswith(PREFIX):
-            p = os.path.join(TMP, name)
-            if time.time() - os.path.getmtime(p) > 600:
-                shutil.rmtree(p, ignore_errors=True)
 
 
 class GateHarness:
@@ -230,7 +221,7 @@ class TestGate(unittest.TestCase):
             f.write("x = 1\n")
         fake = self.h.fake("n.md", NOTES_VERDICT)
         out = self.h.hook("UserPromptSubmit", {"prompt": CONSULT_PROMPT, "cwd": cloud}, PUSHBACK_GATE_FAKE_VERDICT=fake)
-        self.assertIn("cloud-synced", out["hookSpecificOutput"]["additionalContext"])
+        self.assertIn("Internal context only", out["hookSpecificOutput"]["additionalContext"])
         self.assertFalse(os.path.exists(os.path.join(cloud, ".git")))
         self.assertFalse(self.h.gen()["restorable"])
         self.h.wait_status({"done"})
@@ -395,12 +386,13 @@ class TestGate(unittest.TestCase):
         self.assertTrue(g["restorable"])
         self.assertEqual(g["verdict"], "GO-WITH-NOTES")
 
-    def test_worker_crash_publishes_failure_and_stop_is_silent(self):
+    def test_worker_crash_publishes_failure_once(self):
         self.h.hook("UserPromptSubmit", {"prompt": "Migrate the storage layer to sqlite with a new schema"},
                     PUSHBACK_GATE_FAKE_VERDICT=os.path.join(self.h.fake_dir, "missing.md"))
         g = self.h.wait_status({"failed"})
         self.assertIn("missing", g["error"])
-        self.assertIsNone(self.h.hook("Stop", {"stop_hook_active": False}))
+        self.assertIn("review failed", self.h.hook("Stop", {"stop_hook_active": False})["reason"])
+        self.assertIsNone(self.h.hook("Stop", {"stop_hook_active": True}))
 
     def test_codex_client_same_contract(self):
         fake = self.h.fake("s.md", STOP_VERDICT)
@@ -441,22 +433,22 @@ class TestGate(unittest.TestCase):
         self.h.join_workers()
         out = self.h.hook("PreToolUse", {"tool_name": "Edit", "tool_input": {"file_path": os.path.join(self.h.repo, "app.py")}})
         reason = out["hookSpecificOutput"]["permissionDecisionReason"]
-        self.assertIn("restore refs/pushback-gate/consult-1", reason)
-        self.assertIn("Does this match what you understand success to mean", reason)
+        self.assertIn("restore " + self.h.gen()["checkpoint"], reason)
+        self.assertIn("Compare internally", reason)
 
     def test_disabled_policy_is_silent(self):
-        pol = os.path.join(ROOT, "policy.json")
+        pol = os.path.join(self.h.tmp, "disabled-policy.json")
+        shutil.copy2(os.path.join(ROOT, "policy.json"), pol)
         orig = open(pol).read()
         try:
             d = json.loads(orig)
             d["enabled"] = False
             json.dump(d, open(pol, "w"))
-            self.assertIsNone(self.h.hook("UserPromptSubmit", {"prompt": CONSULT_PROMPT}, PUSHBACK_GATE_FORCE_ENABLED="0"))
+            self.assertIsNone(self.h.hook("UserPromptSubmit", {"prompt": CONSULT_PROMPT}, PUSHBACK_GATE_FORCE_ENABLED="0", PUSHBACK_GATE_POLICY_PATH=pol))
             self.assertFalse(os.path.exists(os.path.join(self.h.state, "sessions")))
         finally:
             open(pol, "w").write(orig)
 
 
 if __name__ == "__main__":
-    cleanup_stale()
     unittest.main(verbosity=1)
