@@ -90,6 +90,27 @@ class Waivers(unittest.TestCase):
         self.assertIn("waived review as minor", out["reason"])
         self.assertIsNone(self.h.hook("Stop", {"stop_hook_active": True}))
 
+    def test_agent_waiver_that_adds_a_dependency_is_flagged(self):
+        self.start_slow_consult()
+        self.bash('%s --by agent "tiny tweak"' % WAIVE)
+        with open(os.path.join(self.h.repo, "requirements.txt"), "w") as f:
+            f.write("requests>=2.31\n")
+        out = self.h.hook("Stop", {"stop_hook_active": False})
+        self.assertIn("possible new dependencies", out["reason"])
+        self.assertIn("requests", out["reason"])
+
+    def test_waived_status_survives_the_reviewer_finishing(self):
+        fake = self.h.fake("notes.md", T.NOTES_VERDICT)
+        self.h.hook("UserPromptSubmit", {"prompt": T.CONSULT_PROMPT}, PUSHBACK_GATE_FAKE_VERDICT=fake, PUSHBACK_GATE_FAKE_DELAY="4")
+        self.h.wait_status({"pending"})
+        self.bash('%s --by agent "tiny tweak"' % WAIVE)
+        deadline = time.time() + 30
+        while time.time() < deadline and not self.h.gen().get("verdict"):
+            time.sleep(0.5)
+        self.assertTrue(self.h.gen().get("verdict"))
+        self.assertEqual(self.h.gen()["status"], "waived")
+        self.assertIsNone(self.bash("git push origin main"))
+
     def test_small_agent_waiver_is_quiet(self):
         self.start_slow_consult()
         self.bash('%s --by agent "tiny tweak"' % WAIVE)

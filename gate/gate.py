@@ -349,7 +349,7 @@ def audit_agent_waiver(state, policy):
         if big:
             why.append("%d changed lines (minor means under %d)" % (res["lines"], policy["size_bands_lines"]["small"]))
         if res["new_deps"]:
-            why.append("possible new dependencies: %s" % ", ".join(res["new_deps"][:5]))
+            why.append("possible new dependencies: %s" % "; ".join("%s: %s" % (f, ", ".join(d)) for f, d in res["new_deps"][:5]))
         return ("Pushback Gate: you waived review as minor (%s), but the finished change has %s. Tell the owner in one line "
                 "and offer a review after the fact; do not run it unless he says so." % (w.get("reason", "")[:120], "; ".join(why)))
     text = state.update(decide)

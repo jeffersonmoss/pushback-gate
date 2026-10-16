@@ -332,7 +332,7 @@ def main():
     def publish(s):
         gg = G.SessionState.gen(s, gen)
         if not text.strip():
-            gg.update({"status": "failed" if gg.get("status") != "superseded" else "superseded", "error": notes[:300],
+            gg.update({"status": gg.get("status") if gg.get("status") in ("superseded", "waived") else "failed", "error": notes[:300],
                        "finished": G.now_iso(), "seconds": secs})
             return
         gg.update({"gen": gen, "reviewer": "%s (%s)" % (rev["label"], model), "model": model, "effort": effort,
@@ -341,7 +341,7 @@ def main():
                    "context_status": parsed["context"] if parsed["context"] in ("MATCH", "UNCERTAIN", "WRONG-REPOSITORY") else "UNCERTAIN",
                    "notes": parsed["notes"], "shape": parsed["shape"], "raw": parsed["raw"][:6000],
                    "late": time.time() > float(gg.get("deadline", 0) or 0)})
-        if gg.get("status") != "superseded":
+        if gg.get("status") not in ("superseded", "waived"):
             gg["status"] = "done"
     state.update(publish)
     G.record_review_outcome(client, rev["label"], bool(text.strip()), notes, policy)
