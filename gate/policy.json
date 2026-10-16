@@ -21,7 +21,7 @@
       ]
     }
   },
-  "classifier_model": "haiku",
+  "classifier_model": "claude-haiku-5-5",
   "effort": "medium",
   "effort_low_when_seven_day_percent_at_least": 90,
   "verdict_gate_seconds": 180,
