@@ -364,13 +364,29 @@ def parse_waive(cmd):
         return None
     # Only an actual invocation counts (python3 .../gate.py waive ... as its own statement), never the same words
     # inside an echo, a heredoc or a document the builder is writing.
-    for statement in G._statements(cmd):
+    for statement in G._statements(_drop_heredoc_bodies(cmd)):
         toks = G._tokens(statement)
         if len(toks) >= 2 and os.path.basename(toks[0]) == "gate.py" and toks[1] == "waive":
             return _waive_args(toks[2:])[:2]
         if len(toks) >= 3 and os.path.basename(toks[0]) in ("python", "python3") and os.path.basename(toks[1]) == "gate.py" and toks[2] == "waive":
             return _waive_args(toks[3:])[:2]
     return None
+
+
+def _drop_heredoc_bodies(cmd):
+    """Remove here-document bodies, so text being written to a file is never read as a command."""
+    import re
+    out, end = [], None
+    for line in cmd.split("\n"):
+        if end is not None:
+            if line.strip() == end:
+                end = None
+            continue
+        out.append(line)
+        m = re.search(r"<<-?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?", line)
+        if m:
+            end = m.group(1)
+    return "\n".join(out)
 
 
 def _waive_args(args):

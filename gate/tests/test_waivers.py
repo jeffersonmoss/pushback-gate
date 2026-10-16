@@ -71,6 +71,7 @@ class Waivers(unittest.TestCase):
         self.start_slow_consult()
         self.bash("cat >> README.md <<'EOF'\nRun `%s --by agent \"minor\"` to waive.\nEOF" % WAIVE)
         self.bash('echo "%s --by agent minor"' % WAIVE)
+        self.bash("cat > notes.md <<EOF\n%s --by owner because\nEOF" % WAIVE)
         self.assertEqual(self.h.gen()["status"], "pending")
 
     def test_agent_cannot_waive_a_review_the_owner_asked_for(self):
